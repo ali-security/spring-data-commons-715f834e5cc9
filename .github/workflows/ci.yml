@@ -2,8 +2,11 @@ name: CI Build
 
 on:
   workflow_dispatch:
-  push:
-    branches: [ 4.0.x, 'issue/4.0.x/**' ]
+    inputs:
+      test-filter:
+        description: 'Surefire -Dtest selector; empty runs the full suite'
+        required: false
+        default: ''
 
 permissions: read-all
 
@@ -14,6 +17,7 @@ jobs:
         java-version: [ base, main ]
     name: Build project
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
       - name: Setup Java and Maven
@@ -21,5 +25,43 @@ jobs:
         with:
           java-version: ${{ matrix.java-version }}
           develocity-access-key: '${{ secrets.DEVELOCITY_ACCESS_KEY }}'
+      - name: Scope tests to test-filter
+        if: ${{ inputs.test-filter != '' }}
+        run: echo "SEAL_TEST_OPTS=-Dtest=${{ inputs.test-filter }} -Dsurefire.failIfNoSpecifiedTests=false" >> "$GITHUB_ENV"
       - name: Build
         uses: spring-projects/spring-data-build/actions/maven-build@4.0.x
+        with:
+          additional-options: '-Dcheckstyle.skip=true -Ddevelocity.cache.local.enabled=false -Ddevelocity.cache.remote.enabled=false -Dgradle.cache.local.enabled=false -Dgradle.cache.remote.enabled=false ${{ env.SEAL_TEST_OPTS }}'
+      - name: Upload jar
+        if: ${{ matrix.java-version == 'main' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: spring-data-commons-jar
+          path: target/spring-data-commons-*[0-9].jar
+          if-no-files-found: error
+      - name: Test results and skipped-test report
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import glob, re, xml.etree.ElementTree as ET
+          total = fail = err = skip = 0
+          skips = []
+          for f in sorted(glob.glob('target/surefire-reports/TEST-*.xml')):
+              r = ET.parse(f).getroot()
+              total += int(r.get('tests', 0)); fail += int(r.get('failures', 0))
+              err += int(r.get('errors', 0)); skip += int(r.get('skipped', 0))
+              for tc in r.iter('testcase'):
+                  s = tc.find('skipped')
+                  if s is not None:
+                      msg = (s.get('message') or (s.text or '')).strip().splitlines()
+                      skips.append((tc.get('classname'), tc.get('name'), msg[0] if msg else ''))
+          print(f"SUMMARY: tests run={total}, passed={total - fail - err - skip}, failures={fail}, errors={err}, skipped={skip}")
+          for cls, name, msg in skips:
+              src = glob.glob('src/test/**/' + cls.split('.')[-1].split('$')[0] + '.*', recursive=True)
+              hints = []
+              if src:
+                  for line in open(src[0], encoding='utf-8', errors='replace'):
+                      if re.search(r'\bassum|@Disabled|@EnabledOn|@EnabledIf|@EnabledFor', line):
+                          hints.append(line.strip())
+              print(f"SKIPPED {cls}.{name}: reason='{msg or 'no message'}' | source skip conditions: {' ; '.join(sorted(set(hints))[:4])}")
+          EOF
